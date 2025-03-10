@@ -19,8 +19,7 @@ fn main() {
         std::fs::write("src/app/shader.vert.spv", binary_result.as_binary_u8()).unwrap();
         let fragment_shader_template = include_str!("src/app/shader.frag");
         let content = include_str!("src/app/default.glsl");
-        let map = [("content".to_string(), content.to_string())]
-            .into_iter()
+        let map = std::iter::once(("content".to_string(), content.to_string()))
             .collect::<std::collections::HashMap<String, String>>();
         let fragment_shader = strfmt::strfmt(fragment_shader_template, &map).unwrap();
         let binary_result = compiler

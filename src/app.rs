@@ -19,10 +19,10 @@ use std::borrow::Cow;
 mod shader;
 pub use shader::*;
 
-pub(crate) type Result<T> = anyhow::Result<T>;
+pub type Result<T> = anyhow::Result<T>;
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
-pub struct TemplateApp {
+pub struct App {
     wgpu_callback: WgpuCallback,
     render_state: RenderState,
     shader_dirty: bool,
@@ -85,13 +85,13 @@ fn create_pipeline(
         vertex: wgpu::VertexState {
             module: &vertex_shader,
             entry_point: Some("main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module: &fragment_shader,
             entry_point: Some("main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(target_format.into())],
         }),
         multiview: None,
@@ -101,8 +101,9 @@ fn create_pipeline(
         cache: None,
     })
 }
-impl TemplateApp {
+impl App {
     /// Called once before the first frame.
+    #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_logger::builder().init().unwrap();
         let render_state = cc.wgpu_render_state.as_ref().expect("WGPU enabled");
@@ -240,7 +241,7 @@ impl egui_wgpu::CallbackTrait for WgpuCallback {
         let resources: &TriangleRenderResources = callback_resources.get().unwrap();
         queue.write_buffer(&resources.uniform_buffer, 0, unsafe {
             std::slice::from_raw_parts(
-                &self.uniform as *const WgpuUniform as *const u8,
+                std::ptr::from_ref::<WgpuUniform>(&self.uniform).cast::<u8>(),
                 std::mem::size_of::<WgpuUniform>(),
             )
         });
@@ -272,13 +273,12 @@ impl egui_wgpu::CallbackTrait for WgpuCallback {
     }
 }
 
-impl eframe::App for TemplateApp {
+impl eframe::App for App {
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
         {
             let mut renderer = self.render_state.renderer.write();
-
             let triangle_render_resources = renderer
                 .callback_resources
                 .get_mut::<TriangleRenderResources>()

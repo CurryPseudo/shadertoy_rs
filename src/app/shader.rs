@@ -20,14 +20,10 @@ pub fn convert_shader(source: &str, stage: shaderc::ShaderKind) -> crate::app::R
 }
 #[cfg(not(target_arch = "wasm32"))]
 macro_rules! load_shader {
-    ($path:literal) => {
-        if cfg!(target_arch = "wasm32") {
-            include_str!($path).to_string()
-        } else {
-            let path = format!("src/app/{}", $path);
-            std::fs::read_to_string(&std::path::Path::new(&path))?
-        }
-    };
+    ($path:literal) => {{
+        let path = format!("src/app/{}", $path);
+        std::fs::read_to_string(&std::path::Path::new(&path))?
+    }};
 }
 
 pub fn load_vertex_shader() -> crate::app::Result<Cow<'static, [u32]>> {

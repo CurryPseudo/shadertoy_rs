@@ -38,6 +38,14 @@ pub struct App {
     _fragment_shader_file_watcher: notify::RecommendedWatcher,
     #[cfg(not(target_arch = "wasm32"))]
     fragment_shader_file_watch_rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    _external_glsl_file_watcher: Option<notify::RecommendedWatcher>,
+    #[cfg(not(target_arch = "wasm32"))]
+    external_glsl_file_watch_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    external_glsl_file_path: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    monitor_external_file: bool,
 }
 
 fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -105,7 +113,8 @@ impl App {
     /// Called once before the first frame.
     #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        egui_logger::builder().init().unwrap();
+        // Initialize the logging system, but ignore possible errors
+        let _ = egui_logger::builder().init();
         let render_state = cc.wgpu_render_state.as_ref().expect("WGPU enabled");
 
         let device = &render_state.device;
@@ -136,34 +145,61 @@ impl App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut vertex_shader_file_watcher;
+            let vertex_shader_file_watcher;
             let vertex_shader_file_watch_rx;
-            {
-                let (tx, rx) = std::sync::mpsc::channel();
-                vertex_shader_file_watcher =
-                    notify::RecommendedWatcher::new(tx, notify::Config::default()).unwrap();
-                vertex_shader_file_watcher
-                    .watch(
-                        std::path::Path::new("src/app/shader.vert"),
-                        notify::RecursiveMode::NonRecursive,
-                    )
-                    .unwrap();
-                vertex_shader_file_watch_rx = rx;
-            }
-            let mut fragment_shader_file_watcher;
+            let fragment_shader_file_watcher;
             let fragment_shader_file_watch_rx;
+
+            // Use a safer way to initialize file watchers
             {
                 let (tx, rx) = std::sync::mpsc::channel();
-                fragment_shader_file_watcher =
-                    notify::RecommendedWatcher::new(tx, notify::Config::default()).unwrap();
-                fragment_shader_file_watcher
-                    .watch(
-                        std::path::Path::new("src/app/shader.frag"),
-                        notify::RecursiveMode::NonRecursive,
-                    )
-                    .unwrap();
-                fragment_shader_file_watch_rx = rx;
+
+                match notify::RecommendedWatcher::new(tx, notify::Config::default()) {
+                    Ok(mut watcher) => {
+                        let vert_path = std::path::Path::new("src/app/shader.vert");
+                        if let Err(e) =
+                            watcher.watch(vert_path, notify::RecursiveMode::NonRecursive)
+                        {
+                            error!("Cannot monitor vertex shader file: {}", e);
+                        }
+                        vertex_shader_file_watcher = watcher;
+                        vertex_shader_file_watch_rx = rx;
+                    }
+                    Err(e) => {
+                        error!("Failed to create vertex shader watcher: {}", e);
+                        // If creation fails, use an invalid channel
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        vertex_shader_file_watcher =
+                            notify::RecommendedWatcher::new(tx, notify::Config::default()).unwrap();
+                        vertex_shader_file_watch_rx = rx;
+                    }
+                }
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                match notify::RecommendedWatcher::new(tx, notify::Config::default()) {
+                    Ok(mut watcher) => {
+                        let frag_path = std::path::Path::new("src/app/shader.frag");
+                        if let Err(e) =
+                            watcher.watch(frag_path, notify::RecursiveMode::NonRecursive)
+                        {
+                            error!("Cannot monitor fragment shader file: {}", e);
+                        }
+                        fragment_shader_file_watcher = watcher;
+                        fragment_shader_file_watch_rx = rx;
+                    }
+                    Err(e) => {
+                        error!("Failed to create fragment shader watcher: {}", e);
+                        // If creation fails, use an invalid channel
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        fragment_shader_file_watcher =
+                            notify::RecommendedWatcher::new(tx, notify::Config::default()).unwrap();
+                        fragment_shader_file_watch_rx = rx;
+                    }
+                }
             }
+
+            info!("Application initialization complete");
+
             Self {
                 wgpu_callback: WgpuCallback::default(),
                 render_state: render_state.clone(),
@@ -176,6 +212,10 @@ impl App {
                 vertex_shader_file_watch_rx,
                 _fragment_shader_file_watcher: fragment_shader_file_watcher,
                 fragment_shader_file_watch_rx,
+                _external_glsl_file_watcher: None,
+                external_glsl_file_watch_rx: None,
+                external_glsl_file_path: None,
+                monitor_external_file: false,
             }
         }
         #[cfg(target_arch = "wasm32")]
@@ -190,6 +230,131 @@ impl App {
                 shader_content: include_str!("app/default.glsl").to_string(),
             }
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_external_glsl_file_watcher(&mut self, file_path: &str) -> Result<()> {
+        use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::path::Path;
+        use std::time::Duration;
+
+        // Stop existing watchers (if any)
+        if self._external_glsl_file_watcher.is_some() {
+            info!("Stopping existing file watcher");
+            self._external_glsl_file_watcher = None;
+            self.external_glsl_file_watch_rx = None;
+        }
+
+        // Check if the file exists
+        let file_path = Path::new(file_path);
+        if !file_path.exists() {
+            return Err(anyhow::anyhow!(
+                "File does not exist: {}",
+                file_path.display()
+            ));
+        }
+
+        // Try to read the file content (test permissions in advance)
+        match std::fs::read_to_string(file_path) {
+            Ok(content) => {
+                info!(
+                    "Successfully read file content, length: {} bytes",
+                    content.len()
+                );
+                self.shader_content = content;
+                self.shader_dirty = true;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Cannot read file: {}", e));
+            }
+        }
+
+        // Normalize file path
+        let canonical_path = match std::fs::canonicalize(file_path) {
+            Ok(path) => path,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Cannot get normalized path: {}", e));
+            }
+        };
+
+        let path_str = canonical_path.to_string_lossy().to_string();
+        info!("Normalized path: {}", path_str);
+
+        // Create new watcher with more sensitive configuration
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut config = Config::default();
+        config = config.with_poll_interval(Duration::from_millis(100)); // Shorter polling interval
+
+        let mut watcher = match RecommendedWatcher::new(tx, config) {
+            Ok(w) => w,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Cannot create file watcher: {}", e));
+            }
+        };
+
+        // Watch the specified file
+        match watcher.watch(&canonical_path, RecursiveMode::NonRecursive) {
+            Ok(_) => info!("Successfully set up file monitoring: {}", path_str),
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to set up file monitoring: {}", e));
+            }
+        }
+
+        // Save file path and watcher
+        self.external_glsl_file_path = Some(path_str);
+        self._external_glsl_file_watcher = Some(watcher);
+        self.external_glsl_file_watch_rx = Some(rx);
+        self.monitor_external_file = true;
+
+        info!("Successfully set up external GLSL file monitoring");
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_external_glsl_file(&mut self) -> Result<()> {
+        use std::fs;
+        use std::path::Path;
+
+        if let Some(file_path) = &self.external_glsl_file_path {
+            info!("Attempting to read file: {}", file_path);
+
+            let file_path = Path::new(file_path);
+
+            // Check if the file exists
+            if !file_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "File does not exist: {}",
+                    file_path.display()
+                ));
+            }
+
+            // Read file content
+            match fs::read_to_string(file_path) {
+                Ok(content) => {
+                    info!(
+                        "Successfully read file content, length: {} bytes",
+                        content.len()
+                    );
+                    self.shader_content = content;
+                    self.shader_dirty = true;
+                    info!("Shader content updated and marked for recompilation");
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to read file: {}", e));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("External GLSL file path not set"));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn handle_web_specific_tasks(&mut self, _ctx: &egui::Context) {
+        // This method is intentionally left empty for now
+        // It can be used to implement web-specific functionality in the future
+        // Like handling browser events, etc.
     }
 }
 
@@ -277,6 +442,53 @@ impl eframe::App for App {
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
+
+        // Web-specific operations (if any)
+        #[cfg(target_arch = "wasm32")]
+        self.handle_web_specific_tasks(ctx);
+
+        // Check for changes to the external GLSL file
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut external_file_changed = false;
+            if self.monitor_external_file {
+                if let Some(rx) = &self.external_glsl_file_watch_rx {
+                    // Handle all types of file change events
+                    while let Ok(event) = rx.try_recv() {
+                        match event {
+                            Ok(notify::Event { kind, paths, .. }) => match kind {
+                                notify::EventKind::Modify(_) => {
+                                    info!("Detected external GLSL file modification: {:?}", paths);
+                                    external_file_changed = true;
+                                }
+                                notify::EventKind::Create(_) => {
+                                    info!("Detected external GLSL file creation: {:?}", paths);
+                                    external_file_changed = true;
+                                }
+                                notify::EventKind::Access(_) => {
+                                    info!("Detected external GLSL file access: {:?}", paths);
+                                }
+                                _ => {
+                                    info!("Detected other file event: {:?} - {:?}", kind, paths);
+                                }
+                            },
+                            Err(e) => {
+                                error!("File monitoring error: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle external file changes separately to avoid borrowing conflicts
+            if external_file_changed {
+                match self.read_external_glsl_file() {
+                    Ok(_) => info!("External GLSL file successfully reloaded"),
+                    Err(err) => error!("Failed to read external GLSL file: {}", err),
+                }
+            }
+        }
+
         {
             let mut renderer = self.render_state.renderer.write();
             let triangle_render_resources = renderer
@@ -300,7 +512,7 @@ impl eframe::App for App {
                     ..
                 })) = self.fragment_shader_file_watch_rx.try_recv()
                 {
-                    info!("Vertex shader file modified");
+                    info!("Fragment shader file modified");
                     self.shader_dirty = true;
                     while let Ok(Ok(_)) = self.fragment_shader_file_watch_rx.try_recv() {}
                 }
@@ -362,6 +574,36 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.shader_editor, "Shader Editor");
                 ui.checkbox(&mut self.show_logger, "Log");
             });
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.monitor_external_file, "Monitor External File");
+
+                    if ui.button("Select GLSL File").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("GLSL", &["glsl", "frag", "vert"])
+                            .pick_file()
+                        {
+                            if let Some(path_str) = path.to_str() {
+                                match self.set_external_glsl_file_watcher(path_str) {
+                                    Ok(_) => {
+                                        info!("Successfully set up file monitoring: {}", path_str)
+                                    }
+                                    Err(err) => error!("Failed to set up file monitoring: {}", err),
+                                }
+                            }
+                        }
+                    }
+                });
+
+                if self.monitor_external_file {
+                    if let Some(path) = &self.external_glsl_file_path {
+                        ui.label(format!("Monitoring file: {}", path));
+                    }
+                }
+            }
+
             if self.shader_editor {
                 let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
                 let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
